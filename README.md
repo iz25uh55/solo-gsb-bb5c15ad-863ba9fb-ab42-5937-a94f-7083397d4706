@@ -729,6 +729,82 @@ curl -X POST http://localhost:8000/api/v1/isotope-clusters \
                 {"mz":102.00671,"intensity":10.0},{"mz":103.010065,"intensity":2.0}]}'
 ```
 
+### `POST /api/v1/consensus-spectrum`
+
+**重复测量共识谱**：接收 **2～20 组**同一样品的重复质心峰列表（每组 **1～200 个**峰，m/z 严格递增、强度非负且至少一个为正），先把每组谱各自按基峰归一化（基峰 = 100），再把全部谱的峰合并到同一 m/z 轴上做**确定性完全链接聚类**，最后保留覆盖谱数达到 `min_replicates` 的簇并输出共识峰。
+
+聚类规则：
+
+1. **初始**：每个输入峰是一个单成员簇。
+2. **合法合并**：两个簇仅当同时满足以下两条才可合并——
+   - 合并后的簇不含同一输入谱的两个峰（每条谱在一个簇中至多贡献一个峰）；
+   - 合并后簇的**端点跨度**（最高 − 最低 m/z）不超过 `max(tolerance_da, 端点均值 × tolerance_ppm / 1e6)`，端点均值为合并簇最低、最高 m/z 的算术平均。
+3. **择优**：每轮在全部合法合并对中按 **(合并后跨度, 合并后最低 m/z, 成员(谱索引, 峰索引)序列)** 字典序取最优者合并，直到不存在合法合并为止（同一输入下结果完全确定）。
+4. **保留与输出**：覆盖谱数 ≥ `min_replicates` 的簇输出为共识峰：
+   - `mz`：成员 m/z 按**原始（请求）强度**加权的平均（成员原始强度全为 0 时退化为算术平均）；
+   - `intensity`：成员**基峰归一化强度**的中位数——缺失谱（不在簇中的谱）按 0 计入，即对全部 N 条谱取中位数；
+   - `members`：成员峰的 (谱索引, 峰索引)，均为 0 基。
+5. 共识峰按 `mz` 升序返回。
+
+请求体：
+
+```json
+{
+  "spectra": [
+    {"peaks": [{"mz": 100.0, "intensity": 50.0}, {"mz": 200.0, "intensity": 100.0}]},
+    {"peaks": [{"mz": 100.004, "intensity": 80.0}, {"mz": 200.006, "intensity": 40.0}]},
+    {"peaks": [{"mz": 100.002, "intensity": 30.0}]}
+  ],
+  "tolerance_da": 0.005,
+  "tolerance_ppm": 0.0,
+  "min_replicates": 2
+}
+```
+
+- `spectra`（必填，**2～20 组**）：每组为 `{"peaks": [...]}`，峰字段为 `mz`/`intensity`；每组内 m/z 必须**严格递增**（重复或逆序返回带 `spectrum_index`/`peak_index` 的 422），强度为非负有限数且每组至少一个正强度（全零谱无法做基峰归一化，返回 `zero_spectrum` 422）。
+- `tolerance_da`（必填，>0 的有限数，Da）/ `tolerance_ppm`（必填，≥0 的有限数）：合并簇端点跨度的上限为两者的 `max()` 组合——低质量端由 Da 容差主导，高质量端由 ppm 容差主导。
+- `min_replicates`（必填，**2～20** 的整数）：簇至少覆盖的谱数；超过实际谱数时不报错，只是结果为空。
+
+响应：
+
+```json
+{
+  "spectrum_count": 3,
+  "tolerance_da": 0.005,
+  "tolerance_ppm": 0.0,
+  "min_replicates": 2,
+  "peak_count": 5,
+  "cluster_count": 1,
+  "clusters": [
+    {
+      "mz": 100.002375,
+      "intensity": 100.0,
+      "spectrum_count": 3,
+      "members": [
+        {"spectrum_index": 0, "peak_index": 0},
+        {"spectrum_index": 1, "peak_index": 0},
+        {"spectrum_index": 2, "peak_index": 0}
+      ]
+    }
+  ]
+}
+```
+
+- `spectrum_count`：输入谱数；`peak_count`：全部谱的输入峰总数；`cluster_count`：达到 `min_replicates` 的共识峰数。
+- `clusters`：按 `mz` 升序的共识峰。`mz` 为成员原始强度加权平均 m/z；`intensity` 为缺失谱按 0 计入的归一化强度中位数；`spectrum_count` 为该簇覆盖的谱数；`members` 为成员峰的 0 基 `spectrum_index`/`peak_index`。
+- 上例中 200 Da 附近的两个峰相距 0.006 Da 超出容差，各自保持单成员簇而被 `min_replicates` 过滤，故只返回 100 Da 处的共识峰。
+- **没有任何簇达到 `min_replicates` 时正常返回 200**：`clusters` 为空列表、`cluster_count` 为 0。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/consensus-spectrum \
+  -H 'Content-Type: application/json' \
+  -d '{"tolerance_da":0.005,"tolerance_ppm":5.0,"min_replicates":2,
+       "spectra":[
+         {"peaks":[{"mz":100.0,"intensity":50.0},{"mz":200.0,"intensity":100.0}]},
+         {"peaks":[{"mz":100.004,"intensity":80.0},{"mz":200.006,"intensity":40.0}]},
+         {"peaks":[{"mz":100.002,"intensity":30.0}]}]}'
+```
+
 ### `POST /api/v1/enrichment-fit`
 
 估计分子中单个同位素标记的丰度（富集度）：在 0%～100% 范围内按给定步长网格搜索候选丰度，对每个候选值复用卷积生成归一化包络，与观测峰配对比较，返回均方误差最小的丰度。
@@ -897,7 +973,7 @@ curl -X POST http://localhost:8000/api/v1/isotope-clusters \
 
 - `invalid_label`：标签非法——格式错误（应为 `13C` 形式）、未知元素符号、未知质量数（`position` 为标签字符串中的 0 基字符位置）。
 - `invalid_labels`：双标签组合非法——两个标签属于同一元素（`index` 为标签列表中出错标签的 0 基索引）。
-- `invalid_peaks`：观测峰列表为空、质量非递增或重复（`index` 为出错峰的 0 基索引，空列表时为 `null`）。`/api/v1/isotope-clusters` 复用同一错误结构报告峰 m/z 非严格递增或重复（该接口允许全零强度，不做"至少一个正强度"校验）。
+- `invalid_peaks`：观测峰列表为空、质量非递增或重复（`index` 为出错峰的 0 基索引，空列表时为 `null`）。`/api/v1/isotope-clusters` 复用同一错误结构报告峰 m/z 非严格递增或重复（该接口允许全零强度，不做"至少一个正强度"校验）。`/api/v1/consensus-spectrum` 也以 `invalid_peaks` 报告某组谱的 m/z 非严格递增或重复，但定位字段为 `spectrum_index`（出错谱的 0 基索引）与 `peak_index`（谱内出错峰的 0 基索引）。
 - `invalid_mass_step`：`/api/v1/neutral-profile` 的 `mass_step` 非正（Pydantic 字段校验同样会拦截 0/负数并指明 `field`）。
 - `invalid_mass_range`：`/api/v1/neutral-profile` 的质量区间为空或反向（`mass_min ≥ mass_max`，含单侧给定时与自动 ±4σ 边界比较的情形）；`field` 为 `mass_min`。
 - `grid_too_large`：统一网格点数超过 20000（放宽 `mass_step` 或缩窄质量区间）；`field` 为 `mass_step`。
@@ -905,6 +981,7 @@ curl -X POST http://localhost:8000/api/v1/isotope-clusters \
 - `invalid_mass_grid`：`/api/v1/profile-centroid` 的质量网格非法——质量非严格递增，或某间距与首个间距的相对误差超过 1e-6；`field` 为 `profile`，`index` 为首个违规间距右端点的 0 基索引。
 - `invalid_profile`：`/api/v1/profile-centroid` 的轮廓点数不在 3～20000、强度为负或存在非有限值（`field` 为 `profile`，索引问题附 `index`）。
 - `zero_profile`：`/api/v1/profile-centroid` 的轮廓强度全部为零（至少需要一个正强度点）；`field` 为 `profile`。
+- `zero_spectrum`：`/api/v1/consensus-spectrum` 的某组谱强度全部为零（基峰归一化至少需要一个正强度峰）；随附 `spectrum_index`（出错谱的 0 基索引），`peak_index` 为 `null`。
 - `no_candidates`：`/api/v1/profile-centroid` 阈值过滤后不存在任何平顶局部极大候选；`field` 为 `relative_threshold`。
 - `search_limit_exceeded`：`/api/v1/formula-search` 的分支限界枚举访问节点超过 100 万（随附 `visited_nodes`、`pruned_branches` 与 `limit`）；收窄元素计数范围或质量容差后重试。
 - `no_valid_points` / `no_valid_point_pairs` / `too_few_inliers` / `non_positive_slope`：`/api/v1/mass-calibrate` 的拟合级失败——有效校准点为空、有效点理论 m/z 全相同无法成对点对、初模内点少于 3 个、最终最小二乘斜率非正，均返回 422 且 `detail.message` 说明原因（内点不足时含实际内点数与 `tolerance_ppm`）。注意：**单个**校准点的分子式/加合物非法不是请求失败，该点以 `valid: false`、`error` 为 `invalid_formula`/`invalid_adduct` 出现在 200 响应中。
@@ -962,5 +1039,6 @@ pytest                                 # 运行测试
 - **双元素联合拟合**：`POST /api/v1/dual-enrichment-fit` 在两个不同元素标签的丰度上做二维网格搜索，组合两种富集分布后沿用同一套卷积、一对一配对与含未匹配峰的 MSE。与两个候选丰度都无关的"其余元素包络"只卷积一次并在全网格复用；第一元素的富集多项式在其外层丰度固定时只计算一次。MSE 相同按两项丰度（请求顺序）升序字典序取解，`search_points` 为两网格点数之积。
 - **分子式反推**：`POST /api/v1/formula-search`（`app/formula_search.py`）对 2～6 个不重复元素及各自 0～200 的计数闭区间做深度优先分支限界枚举。元素按单同位素质量从重到轻访问；在每个节点用后缀元素最小/最大可贡献质量（`suffix_min`/`suffix_max`）把当前元素的可行计数夹到整数窗口 ⌈…⌉～⌊…⌋ 并与 `[min_count, max_count]` 取交，窗口外的计数值累加为 `pruned_branches` 且不递归（含 1e-10 Da 浮点保护，叶节点再做一次窗口校验）。命中组成用 `ParsedFormula` 复用天然丰度卷积，基峰归一化后用 `pair_and_score` 与同样归一化的观测峰一对一配对，未匹配峰按零强度计入 MSE；候选按 (MSE, |质量误差|, 元素符号字典序分子式) 稳定排序取前 `max_results`，`total_hits` 返回未截断的命中总数。全零组成不命中；访问节点（根计 1）超过 100 万抛出 `SearchLimitExceeded` 由专用异常处理器转 422；无命中返回 200 空候选列表。
 - **未知同位素簇检测**：`POST /api/v1/isotope-clusters`（`app/isotope_clusters.py`）不依赖分子式，对每个候选电荷 z 以名义步长 `1.003354835/z` 从每个峰出发做深度优先的链生长：用二分查找在后继窗口 `[尾峰 + d·步长 ± 容差]`（d ∈ {1,2}）内取下一个成员，d=2 记录一个缺失位且全链至多一次；每条成员数 ≥ `min_peaks` 的前缀都作为候选（相同成员序列去重）。强度按全谱基峰归一化（全零谱按 0 处理），候选得分为成员强度和 − 10 × 缺失位数。选择阶段是两趟后缀加权区间动态规划：第一趟以 `(总分, 成员总数)` 标量键求出各后缀的最优值对（取候选则跳到其末成员索引 +1，否则前移一位）；第二趟在达到最优的候选中比较**完整后缀序列**（先单同位素 m/z 元组字典序、再电荷元组字典序）重建唯一最优解，避免单状态增量 DP 在前缀延长后平局关系翻转的问题。枚举候选超过 10 万抛 `IsotopeClusterError`（`too_many_candidates`）转 422。选中簇按首成员索引升序返回，未出现在任何簇中的峰索引汇总为 `unassigned_peaks`；无合格候选时簇列表为空。
+- **重复测量共识谱**：`POST /api/v1/consensus-spectrum`（`app/consensus.py`）对 2～20 组质心峰先做逐谱基峰归一化（全零谱抛 `zero_spectrum` 转 422），再把全部峰按 m/z 排序为单成员簇，做确定性完全链接凝聚聚类：合并对合法当且仅当两簇不共享输入谱且合并簇端点跨度 ≤ `max(tolerance_da, 端点均值 × tolerance_ppm/1e6)`；每轮用最小堆取出按 (合并跨度, 最低 m/z, 成员(谱,峰)索引) 字典序最优的合法对合并（失效堆项惰性删除，新簇只与跨度上界窗口内的簇再评估），直到无合法合并。覆盖谱数 ≥ `min_replicates` 的簇以原始强度加权 m/z、成员索引与缺失谱按 0 计入的归一化强度中位数输出，按 m/z 升序；谱 m/z 非严格递增以带 `spectrum_index`/`peak_index` 的 `invalid_peaks` 转 422。
 - **同位素数据**：`app/isotopes.py` 内置约 50 种常见元素的 AME/CIAAW 同位素质量与天然丰度，可按需扩充。
 - **持久化**：SQLite 存计算结果缓存（`envelope_cache`）与请求日志（`request_log`），schema 随服务启动自动创建。

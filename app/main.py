@@ -23,6 +23,7 @@ from .calibration import (
 )
 from .centroid import CentroidError, centroid_profile
 from .config import settings
+from .consensus import ConsensusError, build_consensus_spectrum
 from .enrichment import (
     LabelCombinationError,
     PeakListError,
@@ -79,7 +80,9 @@ app = FastAPI(
         "calibrates the mass axis with a robust median-slope initial "
         "model followed by an inlier least-squares line, and detects "
         "unknown isotope clusters de novo in centroid m/z peak lists via "
-        "neutron-spacing candidate chains and weighted-interval selection."
+        "neutron-spacing candidate chains and weighted-interval selection, "
+        "and builds a consensus spectrum from replicate centroid peak "
+        "lists via deterministic complete-linkage clustering."
     ),
     lifespan=lifespan,
 )
@@ -1018,6 +1021,123 @@ class IsotopeClustersResponse(BaseModel):
     )
 
 
+class ConsensusPeakIn(BaseModel):
+    mz: float = Field(
+        ..., description="Observed centroid m/z; strictly increasing within its spectrum"
+    )
+    intensity: float = Field(
+        ...,
+        ge=0,
+        description="Peak intensity (non-negative; at least one positive per spectrum)",
+    )
+
+
+class ConsensusSpectrumIn(BaseModel):
+    peaks: list[ConsensusPeakIn] = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Centroid peaks of one replicate spectrum, 1-200 entries "
+            "sorted by strictly increasing m/z"
+        ),
+    )
+
+    @field_validator("peaks")
+    @classmethod
+    def peaks_must_be_finite(
+        cls, value: list[ConsensusPeakIn]
+    ) -> list[ConsensusPeakIn]:
+        for peak in value:
+            if not math.isfinite(peak.mz) or not math.isfinite(peak.intensity):
+                raise ValueError("mz and intensity must be finite numbers")
+        return value
+
+
+class ConsensusSpectrumRequest(BaseModel):
+    spectra: list[ConsensusSpectrumIn] = Field(
+        ...,
+        min_length=2,
+        max_length=20,
+        description="2-20 replicate centroid spectra of the same sample",
+    )
+    tolerance_da: float = Field(
+        ...,
+        gt=0,
+        description=(
+            "Absolute m/z tolerance (Da); a merged cluster's endpoint span "
+            "must not exceed max(tolerance_da, endpoint mean x "
+            "tolerance_ppm / 1e6)"
+        ),
+        examples=[0.005],
+    )
+    tolerance_ppm: float = Field(
+        ...,
+        ge=0,
+        description=(
+            "Relative m/z tolerance (ppm); combined with tolerance_da via "
+            "max() on the merged cluster's endpoint mean"
+        ),
+        examples=[5.0],
+    )
+    min_replicates: int = Field(
+        ...,
+        ge=2,
+        le=20,
+        description="Minimum number of spectra a cluster must cover to be reported",
+        examples=[2],
+    )
+
+    @field_validator("tolerance_da", "tolerance_ppm")
+    @classmethod
+    def tolerances_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("tolerance must be a finite number")
+        return value
+
+
+class ConsensusMemberOut(BaseModel):
+    spectrum_index: int = Field(..., description="0-based index of the input spectrum")
+    peak_index: int = Field(
+        ..., description="0-based index of the peak within that spectrum"
+    )
+
+
+class ConsensusClusterOut(BaseModel):
+    mz: float = Field(
+        ...,
+        description=(
+            "Consensus m/z: member m/z average weighted by the original "
+            "(request) intensities"
+        ),
+    )
+    intensity: float = Field(
+        ...,
+        description=(
+            "Median of the base-peak-normalised member intensities; "
+            "spectra absent from the cluster count as 0"
+        ),
+    )
+    spectrum_count: int = Field(
+        ..., description="Number of distinct spectra covered by the cluster"
+    )
+    members: list[ConsensusMemberOut]
+
+
+class ConsensusSpectrumResponse(BaseModel):
+    spectrum_count: int
+    tolerance_da: float
+    tolerance_ppm: float
+    min_replicates: int
+    peak_count: int = Field(
+        ..., description="Total number of input peaks across all spectra"
+    )
+    cluster_count: int
+    clusters: list[ConsensusClusterOut] = Field(
+        ..., description="Consensus peaks, ordered by ascending m/z"
+    )
+
+
 @app.exception_handler(CalibrationError)
 async def calibration_error_handler(
     request: Request, exc: CalibrationError
@@ -1147,6 +1267,23 @@ async def isotope_cluster_error_handler(
                 "error": exc.error,
                 "message": exc.message,
                 "field": exc.field,
+            }
+        },
+    )
+
+
+@app.exception_handler(ConsensusError)
+async def consensus_error_handler(
+    request: Request, exc: ConsensusError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error": exc.error,
+                "message": exc.message,
+                "spectrum_index": exc.spectrum_index,
+                "peak_index": exc.peak_index,
             }
         },
     )
@@ -1973,4 +2110,63 @@ def isotope_clusters(req: IsotopeClustersRequest) -> dict:
             for cluster in result.clusters
         ],
         "unassigned_peaks": list(result.unassigned_indices),
+    }
+
+
+@app.post("/api/v1/consensus-spectrum", response_model=ConsensusSpectrumResponse)
+def consensus_spectrum(req: ConsensusSpectrumRequest) -> dict:
+    """Build a consensus spectrum from replicate centroid measurements.
+
+    Each of the 2-20 spectra is first normalised to its own base peak
+    (100); all peaks are then pooled onto one m/z axis and clustered by a
+    deterministic complete-linkage agglomerative clustering: two clusters
+    merge only when the merged cluster would not hold two peaks of the
+    same input spectrum and its endpoint span does not exceed
+    ``max(tolerance_da, endpoint_mean * tolerance_ppm / 1e6)``. Every
+    round merges the best legal pair by (merged span, merged lowest m/z,
+    member spectrum/peak indices) until no legal merge remains. Clusters
+    covering at least ``min_replicates`` spectra are returned with the
+    original-intensity-weighted m/z, the member (spectrum, peak) indices
+    and the median of the base-peak-normalised intensities (spectra absent
+    from the cluster count as 0), sorted by ascending m/z.
+    """
+    spectra = [
+        [(peak.mz, peak.intensity) for peak in spectrum.peaks]
+        for spectrum in req.spectra
+    ]
+    result = build_consensus_spectrum(
+        spectra, req.tolerance_da, req.tolerance_ppm, req.min_replicates
+    )
+
+    db.log_request(
+        f"consensus-spectrum:{result.spectrum_count}-spectra",
+        None,
+        ok=bool(result.clusters),
+        message=(
+            f"consensus spectrum: {len(result.clusters)} clusters from "
+            f"{result.peak_count} peaks over {result.spectrum_count} spectra"
+        ),
+    )
+    return {
+        "spectrum_count": result.spectrum_count,
+        "tolerance_da": result.tolerance_da,
+        "tolerance_ppm": result.tolerance_ppm,
+        "min_replicates": result.min_replicates,
+        "peak_count": result.peak_count,
+        "cluster_count": len(result.clusters),
+        "clusters": [
+            {
+                "mz": round(cluster.mz, 6),
+                "intensity": round(cluster.intensity, 6),
+                "spectrum_count": len(cluster.members),
+                "members": [
+                    {
+                        "spectrum_index": member.spectrum_index,
+                        "peak_index": member.peak_index,
+                    }
+                    for member in cluster.members
+                ],
+            }
+            for cluster in result.clusters
+        ],
     }
